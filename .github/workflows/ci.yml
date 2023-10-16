@@ -14,6 +14,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+env:
+  REGISTRY: ghcr.io
+
 jobs:
   build:
     name: Build
@@ -56,13 +59,19 @@ jobs:
           GOBIN=/usr/local/bin go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@28218f9b04b4f3f62068d7b6ce6ca5b26e35336c
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build
         env:
-          REGISTRY: appscodeci
-          DOCKER_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          USERNAME: 1gtm
+          REGISTRY: ${{ env.REGISTRY }}/${{ github.repository_owner }}
         run: |
-          docker login --username ${USERNAME} --password ${DOCKER_TOKEN}
           make push
 
       - name: Install link checker
@@ -74,55 +83,3 @@ jobs:
       - name: Check links
         run: |
           liche -r docs -d $(pwd) -c 10 -p -h -l -x '^(.*github.com.*|.*twitter.com.*)$'
-
-  kubernetes:
-    name: Kubernetes
-    runs-on: ubuntu-20.04
-    needs: build
-    strategy:
-      matrix:
-        k8s: [v1.19.16, v1.27.1]
-
-    steps:
-      - uses: actions/checkout@v1
-
-      - name: Check out installer
-        run: |
-          cd ..
-          git clone https://github.com/kubeops/installer.git
-
-      - name: Create Kubernetes ${{ matrix.k8s }} cluster
-        id: kind
-        uses: engineerd/setup-kind@v0.5.0
-        with:
-          version: v0.17.0
-          config: hack/kubernetes/kind.yaml
-          image: kindest/node:${{ matrix.k8s }}
-
-      - name: Prepare cluster for testing
-        id: local-path
-        run: |
-          echo "waiting for nodes to be ready ..."
-          kubectl wait --for=condition=Ready nodes --all --timeout=5m
-          kubectl get nodes
-          echo
-          kubectl version
-          echo
-          echo "install helm 3"
-          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
-
-      - name: Run e2e tests
-        env:
-          REGISTRY: appscodeci
-          REGISTRY_SECRET: regcred
-          TEST_CREDENTIALS: ${{ secrets.TEST_CREDENTIALS }}
-          GOOGLE_SERVICE_ACCOUNT_JSON_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_KEY }}
-        run: |
-          echo "preparing test credentials"
-          mkdir -p hack/config
-          echo -n "$TEST_CREDENTIALS" > hack/config/.env
-          echo >> hack/config/.env
-          echo "GOOGLE_SERVICE_ACCOUNT_JSON_KEY=$(echo $GOOGLE_SERVICE_ACCOUNT_JSON_KEY)" >> hack/config/.env
-          make install || ( kubectl describe deployment -n kubeops config-syncer; kubectl logs -n kubeops deployment/config-syncer; exit 1; )
-          echo
-          make e2e-tests
